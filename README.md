@@ -58,6 +58,23 @@ A question that fails or that you Ctrl-C is rolled back, so it leaves nothing
 behind for the next one to trip over. There are no command-line flags —
 everything is configured in `.env`.
 
+### The turn budget
+
+A question gets 20 turns, and the tools are only there for the first 13. On turn
+14 the loop says so in the conversation and stops offering tools, so the model
+writes its answer from what it already has instead of spending its last turn on
+one more search. The six turns behind the deadline are slack: if that first
+attempt comes back blank there is room to nudge and try again, so a run reaches
+`hit max turns without an answer` only if every one of them did. `MAX_TURNS` and
+`RESERVE_TURNS` in `main.py` set both numbers, and the turn the answer falls due
+is the difference:
+
+```
+[turn 13/20] messages=25
+  -> search_episodes({"episode":"S03"})
+[turn 14/20] messages=27 -- answer due, tools off
+```
+
 ### What the tracing shows
 
 Per turn: tokens in and out, cache reads (`cached=`) and writes (`wrote=`), wall

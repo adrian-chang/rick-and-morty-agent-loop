@@ -51,6 +51,16 @@ MODEL = os.getenv("MODEL", "")
 
 MAX_TURNS = 20
 
+# Turns held back at the end. The tools switch off this many turns before the
+# wall and the answer comes due, so a run that would have spent its last turn on
+# one more search writes the answer instead -- with turns still in hand to have
+# another go if that first attempt comes back blank.
+RESERVE_TURNS = 6
+
+# The turn the tools go away and the answer is due. Never below 1: a reserve as
+# big as the budget would otherwise leave no turn to call a tool in.
+ANSWER_TURN = max(1, MAX_TURNS - RESERVE_TURNS)
+
 # A turn with neither an answer nor a tool call is a malfunction, not a stop.
 # Usually it is a hiccup, so nudge the model rather than ending the run -- but
 # a model that keeps doing it is stuck, and each nudge costs a turn.
@@ -63,6 +73,11 @@ FORGET = {"new", "reset", "clear"}
 NUDGE = """\
 That turn came back empty. Either call a tool to get what you still need, or
 write the answer with what you already have."""
+
+DEADLINE = f"""\
+Turn {ANSWER_TURN} of {MAX_TURNS}: the tools are switched off from here, so this
+turn is the answer. Write it from the observations you already have, and say
+plainly what you could not confirm rather than filling the gap."""
 
 # The API links resources by URL, and a popular location can list hundreds of
 # residents. We hand the model ids instead, capped -- the matching *_count field
@@ -93,9 +108,11 @@ information: loosen the filter, try a different spelling, or reach for another
 tool, rather than repeating the same call unchanged. Never invent a tool, an
 argument, or a result.
 
-You get {MAX_TURNS} turns. Spend them on distinct questions rather than retries
-of the same one, and if you are running out, answer with what you have and name
-what is still missing.
+You get {MAX_TURNS} turns, and the tools only last for the first
+{ANSWER_TURN - 1} of them: on turn {ANSWER_TURN} they switch off and the answer
+is due. Spend the tool turns on distinct questions rather than retries of the
+same one, and when the tools go, answer with what you have and name what is
+still missing.
 
 The final answer is plain prose: no Thought/Action labels, and state what you
 found rather than narrating the search.
@@ -414,12 +431,35 @@ def ask(model: Model, messages: list[ModelMessage], question: str, trace: Trace)
     return _loop(model, messages, trace)
 
 
+def _say(messages: list[ModelMessage], text: str) -> None:
+    """Put a word in from our side, without stacking two requests in a row.
+
+    Providers expect the conversation to alternate, and a request carrying tool
+    results is already our turn to speak -- so the note joins it rather than
+    following it.
+    """
+    part = UserPromptPart(content=text)
+    last = messages[-1] if messages else None
+    if isinstance(last, ModelRequest):
+        last.parts.append(part)
+    else:
+        messages.append(ModelRequest(parts=[part]))
+
+
 def _loop(model: Model, messages: list[ModelMessage], trace: Trace) -> str:
     params = ModelRequestParameters(function_tools=TOOL_SPECS)
     blanks = 0
 
     for turn in range(1, MAX_TURNS + 1):
-        print(f"[turn {turn}/{MAX_TURNS}] messages={len(messages)}")
+        # From ANSWER_TURN on, prose is the only thing left to produce. Saying
+        # so, once, keeps the model from spending the turn reaching for a tool
+        # that is no longer on offer.
+        due = turn >= ANSWER_TURN
+        if turn == ANSWER_TURN:
+            _say(messages, DEADLINE)
+
+        note = " -- answer due, tools off" if due else ""
+        print(f"[turn {turn}/{MAX_TURNS}] messages={len(messages)}{note}")
 
         clock = time.monotonic()
         response = model_request_sync(
@@ -427,9 +467,9 @@ def _loop(model: Model, messages: list[ModelMessage], trace: Trace) -> str:
             messages,
             model_settings=ModelSettings(
                 max_tokens=10000,
-                # Last turn buys nothing but another tool call, so spend it on
-                # an answer.
-                tool_choice="none" if turn == MAX_TURNS else "auto",
+                # Once the answer is due another tool call buys nothing, so
+                # spend the turn -- and the reserve behind it -- on writing.
+                tool_choice="none" if due else "auto",
             ),
             model_request_parameters=params,
         )
@@ -473,7 +513,7 @@ def _loop(model: Model, messages: list[ModelMessage], trace: Trace) -> str:
                 f"last finished on {response.finish_reason!r}"
             )
         print(f"  (blank turn {blanks}/{MAX_BLANK_TURNS}, nudging)")
-        messages.append(ModelRequest(parts=[UserPromptPart(content=NUDGE)]))
+        _say(messages, NUDGE)
 
     return "stopped: hit max turns without an answer"
 
